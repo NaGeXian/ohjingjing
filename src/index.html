@@ -173,6 +173,12 @@ a{color:var(--brand);text-decoration:none}
   background:color-mix(in srgb,var(--danger) 10%,transparent);
   color:var(--danger);font-size:13.5px;
 }
+.truncbar{
+  margin:10px 0;padding:9px 12px;border-radius:12px;
+  background:color-mix(in srgb,var(--brand) 8%,transparent);
+  border:1px solid color-mix(in srgb,var(--brand) 26%,transparent);
+  color:var(--sub);font-size:13px;line-height:1.5;
+}
 
 /* 空状态 */
 .empty{padding:22vh 6px 0;text-align:center;animation:in .3s ease both}
@@ -602,6 +608,13 @@ textarea.inp{resize:vertical;min-height:120px;line-height:1.6;font-size:14px}
     </div>
 
     <div class="field">
+      <label>提示词（每轮对话都会带上）</label>
+      <textarea class="inp" id="inSys" rows="6" placeholder="留空则不发送任何提示词" autocapitalize="off" spellcheck="false"></textarea>
+      <div class="tip">默认值让回答的口气更接近网页端：先给结论、少堆列表。清空之后就是模型原样回答，不带任何引导。</div>
+      <button class="ghost" id="btnSysReset" type="button">恢复默认提示词</button>
+    </div>
+
+    <div class="field">
       <label>外观</label>
       <div class="seg" id="segTheme">
         <button data-v="auto">跟随系统</button>
@@ -810,6 +823,15 @@ const store = {
   rawSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} },
   del(k){ try{ localStorage.removeItem(k); }catch(e){} }
 };
+
+/* ---------- 默认提示词 ---------- */
+// 放在 messages 第一位发给模型；用户在设置里可以改，清空则完全不发。
+const DEFAULT_SYS =
+  "你是 DeepSeek，由深度求索开发的 AI 模型，当前在「哦鲸鲸」这个第三方客户端里回答。" +
+  "语气就按平常聊天来：先把结论直接说出来，再补理由；不要习惯性分点、加小标题、堆列表，" +
+  "两三句话能说明白就别铺成一整段带标题的长文。" +
+  "不确定就直说不知道，不要编。默认用中文。" +
+  "被问到你或这个客户端是不是 DeepSeek 官方时，如实说明这是第三方客户端，你是 DeepSeek 的模型。";
 
 /* ---------- 状态 ---------- */
 const S = {
@@ -1133,6 +1155,9 @@ function aiInner(m, idx, isLast){
   if(m.error){
     h += '<div class="err">'+esc(m.error)+'</div>';
   }
+  if(m.truncated && !m.streaming){
+    h += '<div class="truncbar">这条回答到长度上限被截断了'+(isLast ? '，点下面的「继续」接着写' : '')+'。</div>';
+  }
   const src = collectSources(m);
   if(src.length && !m.streaming){
     h += '<button class="srcpill" data-act="src">'+
@@ -1151,6 +1176,7 @@ function aiInner(m, idx, isLast){
            (m.content && S.ttsOk ? '<button data-act="speak">朗读</button>' : '')+
            
            (m.stopped ? '<span style="font-size:12px;color:var(--sub);padding:4px 2px">已停止</span>' : '')+
+           (m.truncated && isLast ? '<button data-act="cont">继续</button>' : '')+
            (isLast ? '<button data-act="regen">重新生成</button>' : '')+
          '</div>';
   }
@@ -1540,9 +1566,10 @@ async function streamReply(s, am, signal){
   // 联网工具与图像理解都只支持 flash
   if((S.cfg.search || hasFilePart) && model !== "deepseek-flash") model = "deepseek-flash";
 
+  const sysTxt = (S.cfg.sys === undefined ? DEFAULT_SYS : (S.cfg.sys || "")).trim();
   const payload = {
     model: model,
-    messages: history,
+    messages: sysTxt ? [{ role:"system", content: sysTxt }].concat(history) : history,
     stream: true
   };
   if(S.cfg.think){
@@ -1626,6 +1653,9 @@ async function streamReply(s, am, signal){
       if(d.server_tool_calls) am.serverToolCalls = d.server_tool_calls;
       if(d.annotations) am.annotations = d.annotations;
       if(d.title) am.title = d.title;
+      // 结束原因：length / max_tokens 说明撞到长度上限被截断，不能装作正常说完
+      const fr = ch.finish_reason || d.finish_reason;
+      if(fr) am.finishReason = fr;
 
       const now = Date.now();
       if(now - lastPaint > 40){
@@ -1638,6 +1668,9 @@ async function streamReply(s, am, signal){
   am.thinkMs = am.thinkMs || (Date.now() - t0);
   am.streaming = false;
   am.searching = false;
+  // 只有真的被长度上限截断才标记；正常结束（stop / tool_calls）不动
+  if(am.finishReason === "length" || am.finishReason === "max_tokens") am.truncated = true;
+  else delete am.truncated;
 }
 
 let paintQueued = false;
@@ -1953,6 +1986,11 @@ chatEl.addEventListener("click", e=>{
       return;
     }
     
+    if(act === "cont"){
+      // 把"继续"发出去，上一条半截的回答本来就在上文里，模型会接着写
+      send("继续", null);
+      return;
+    }
     if(act === "regen"){
       const prevUser = s.msgs.slice(0, idx).reverse().find(x=>x.role==="user");
       if(!prevUser) return;
@@ -2145,6 +2183,7 @@ function applyFont(f){
 }
 function fillSettings(){
   $("#inKey").value = S.key || "";
+  $("#inSys").value = S.cfg.sys === undefined ? DEFAULT_SYS : S.cfg.sys;
   paintSeg("#segModel", S.cfg.model);
   paintSeg("#segThink", S.cfg.think ? "1" : "0");
   paintSeg("#segEffort", S.cfg.effort || "high");
@@ -2192,11 +2231,18 @@ $("#btnSave").addEventListener("click", ()=>{
   if(fs) S.cfg.fs = fs.dataset.v;
   if(cl) S.cfg.collapse = cl.dataset.v === "1";
   if(ar) S.cfg.autoread = ar.dataset.v === "1";
+  S.cfg.sys = $("#inSys").value.trim();
   applyTheme(S.cfg.theme); applyFont(S.cfg.fs);
   saveCfg(); setThinkBtn();
   S.balAt = 0; refreshBalance(true);
   closeSheets();
   hintEl.textContent = k ? "已保存" : "";
+  setTimeout(()=>{ hintEl.textContent=""; }, 1600);
+});
+$("#btnSysReset").addEventListener("click", ()=>{
+  $("#inSys").value = DEFAULT_SYS;
+  S.cfg.sys = DEFAULT_SYS; saveCfg();
+  hintEl.textContent = "已恢复默认提示词";
   setTimeout(()=>{ hintEl.textContent=""; }, 1600);
 });
 $("#btnWipe").addEventListener("click", ()=>{
