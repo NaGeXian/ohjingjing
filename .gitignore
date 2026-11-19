@@ -1,0 +1,4 @@
+android/build/
+android/release.keystore
+*.log
+.DS_Store
